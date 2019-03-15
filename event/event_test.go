@@ -141,7 +141,7 @@ func TestMuxConcurrent(t *testing.T) {
 	}
 }
 
-func emptySubscriber(mux *TypeMux, types ...interface{}) {
+func emptySubscriber(mux *TypeMux) {
 	s := mux.Subscribe(testEvent(0))
 	go func() {
 		for range s.Chan() {
@@ -149,24 +149,42 @@ func emptySubscriber(mux *TypeMux, types ...interface{}) {
 	}()
 }
 
-func BenchmarkPost3(b *testing.B) {
-	var mux = new(TypeMux)
-	defer mux.Stop()
-	emptySubscriber(mux, testEvent(0))
-	emptySubscriber(mux, testEvent(0))
-	emptySubscriber(mux, testEvent(0))
+func BenchmarkPost1000(b *testing.B) {
+	var (
+		mux              = new(TypeMux)
+		subscribed, done sync.WaitGroup
+		nsubs            = 1000
+	)
+	subscribed.Add(nsubs)
+	done.Add(nsubs)
+	for i := 0; i < nsubs; i++ {
+		go func() {
+			s := mux.Subscribe(testEvent(0))
+			subscribed.Done()
+			for range s.Chan() {
+			}
+			done.Done()
+		}()
+	}
+	subscribed.Wait()
 
+	// The actual benchmark.
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		mux.Post(testEvent(0))
 	}
+
+	b.StopTimer()
+	mux.Stop()
+	done.Wait()
 }
 
 func BenchmarkPostConcurrent(b *testing.B) {
 	var mux = new(TypeMux)
 	defer mux.Stop()
-	emptySubscriber(mux, testEvent(0))
-	emptySubscriber(mux, testEvent(0))
-	emptySubscriber(mux, testEvent(0))
+	emptySubscriber(mux)
+	emptySubscriber(mux)
+	emptySubscriber(mux)
 
 	var wg sync.WaitGroup
 	poster := func() {

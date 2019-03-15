@@ -17,14 +17,12 @@
 package rpc
 
 import (
+	"context"
 	"fmt"
 	"math"
-	"math/big"
-	"reflect"
 	"strings"
-	"sync"
 
-	"gopkg.in/fatih/set.v0"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 )
 
 // API describes the set of methods offered over the RPC interface
@@ -33,62 +31,6 @@ type API struct {
 	Version   string      // api version for DApp's
 	Service   interface{} // receiver instance which holds the methods
 	Public    bool        // indication if the methods must be considered safe for public use
-}
-
-// callback is a method callback which was registered in the server
-type callback struct {
-	rcvr        reflect.Value  // receiver of method
-	method      reflect.Method // callback
-	argTypes    []reflect.Type // input argument types
-	hasCtx      bool           // method's first argument is a context (not included in argTypes)
-	errPos      int            // err return idx, of -1 when method cannot return error
-	isSubscribe bool           // indication if the callback is a subscription
-}
-
-// service represents a registered object
-type service struct {
-	name          string        // name for service
-	rcvr          reflect.Value // receiver of methods for the service
-	typ           reflect.Type  // receiver type
-	callbacks     callbacks     // registered handlers
-	subscriptions subscriptions // available subscriptions/notifications
-}
-
-// serverRequest is an incoming request
-type serverRequest struct {
-	id            interface{}
-	svcname       string
-	rcvr          reflect.Value
-	callb         *callback
-	args          []reflect.Value
-	isUnsubscribe bool
-	err           Error
-}
-
-type serviceRegistry map[string]*service       // collection of services
-type callbacks map[string]*callback            // collection of RPC callbacks
-type subscriptions map[string]*callback        // collection of subscription callbacks
-type subscriptionRegistry map[string]*callback // collection of subscription callbacks
-
-// Server represents a RPC server
-type Server struct {
-	services       serviceRegistry
-	muSubcriptions sync.Mutex // protects subscriptions
-	subscriptions  subscriptionRegistry
-
-	run      int32
-	codecsMu sync.Mutex
-	codecs   *set.Set
-}
-
-// rpcRequest represents a raw incoming RPC request
-type rpcRequest struct {
-	service  string
-	method   string
-	id       interface{}
-	isPubSub bool
-	params   interface{}
-	err      Error // invalid batch element
 }
 
 // Error wraps RPC errors, which contain an error code in addition to the message.
@@ -101,38 +43,27 @@ type Error interface {
 // a RPC session. Implementations must be go-routine safe since the codec can be called in
 // multiple go-routines concurrently.
 type ServerCodec interface {
-	// Read next request
-	ReadRequestHeaders() ([]rpcRequest, bool, Error)
-	// Parse request argument to the given types
-	ParseRequestArguments([]reflect.Type, interface{}) ([]reflect.Value, Error)
-	// Assemble success response, expects response id and payload
-	CreateResponse(interface{}, interface{}) interface{}
-	// Assemble error response, expects response id and error
-	CreateErrorResponse(interface{}, Error) interface{}
-	// Assemble error response with extra information about the error through info
-	CreateErrorResponseWithInfo(id interface{}, err Error, info interface{}) interface{}
-	// Create notification response
-	CreateNotification(string, interface{}) interface{}
-	// Write msg to client.
-	Write(interface{}) error
-	// Close underlying data stream
+	Read() (msgs []*jsonrpcMessage, isBatch bool, err error)
 	Close()
-	// Closed when underlying connection is closed
-	Closed() <-chan interface{}
+	jsonWriter
 }
 
-var (
-	pendingBlockNumber  = big.NewInt(-2)
-	latestBlockNumber   = big.NewInt(-1)
-	earliestBlockNumber = big.NewInt(0)
-	maxBlockNumber      = big.NewInt(math.MaxInt64)
-)
+// jsonWriter can write JSON messages to its underlying connection.
+// Implementations must be safe for concurrent use.
+type jsonWriter interface {
+	Write(context.Context, interface{}) error
+	// Closed returns a channel which is closed when the connection is closed.
+	Closed() <-chan interface{}
+	// RemoteAddr returns the peer address of the connection.
+	RemoteAddr() string
+}
 
 type BlockNumber int64
 
 const (
-	PendingBlockNumber = BlockNumber(-2)
-	LatestBlockNumber  = BlockNumber(-1)
+	PendingBlockNumber  = BlockNumber(-2)
+	LatestBlockNumber   = BlockNumber(-1)
+	EarliestBlockNumber = BlockNumber(0)
 )
 
 // UnmarshalJSON parses the given JSON fragment into a BlockNumber. It supports:
@@ -143,45 +74,32 @@ const (
 // - an out of range error when the given block number is either too little or too large
 func (bn *BlockNumber) UnmarshalJSON(data []byte) error {
 	input := strings.TrimSpace(string(data))
-
 	if len(input) >= 2 && input[0] == '"' && input[len(input)-1] == '"' {
 		input = input[1 : len(input)-1]
 	}
 
-	if len(input) == 0 {
-		*bn = BlockNumber(latestBlockNumber.Int64())
+	switch input {
+	case "earliest":
+		*bn = EarliestBlockNumber
+		return nil
+	case "latest":
+		*bn = LatestBlockNumber
+		return nil
+	case "pending":
+		*bn = PendingBlockNumber
 		return nil
 	}
 
-	in := new(big.Int)
-	_, ok := in.SetString(input, 0)
-
-	if !ok { // test if user supplied string tag
-		strBlockNumber := input
-		if strBlockNumber == "latest" {
-			*bn = BlockNumber(latestBlockNumber.Int64())
-			return nil
-		}
-
-		if strBlockNumber == "earliest" {
-			*bn = BlockNumber(earliestBlockNumber.Int64())
-			return nil
-		}
-
-		if strBlockNumber == "pending" {
-			*bn = BlockNumber(pendingBlockNumber.Int64())
-			return nil
-		}
-
-		return fmt.Errorf(`invalid blocknumber %s`, data)
+	blckNum, err := hexutil.DecodeUint64(input)
+	if err != nil {
+		return err
+	}
+	if blckNum > math.MaxInt64 {
+		return fmt.Errorf("Blocknumber too high")
 	}
 
-	if in.Cmp(earliestBlockNumber) >= 0 && in.Cmp(maxBlockNumber) <= 0 {
-		*bn = BlockNumber(in.Int64())
-		return nil
-	}
-
-	return fmt.Errorf("blocknumber not in range [%d, %d]", earliestBlockNumber, maxBlockNumber)
+	*bn = BlockNumber(blckNum)
+	return nil
 }
 
 func (bn BlockNumber) Int64() int64 {

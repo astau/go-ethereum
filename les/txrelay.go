@@ -21,6 +21,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 type ltrInfo struct {
@@ -35,29 +36,32 @@ type LesTxRelay struct {
 	peerList     []*peer
 	peerStartPos int
 	lock         sync.RWMutex
+
+	reqDist *requestDistributor
 }
 
-func NewLesTxRelay() *LesTxRelay {
-	return &LesTxRelay{
+func NewLesTxRelay(ps *peerSet, reqDist *requestDistributor) *LesTxRelay {
+	r := &LesTxRelay{
 		txSent:    make(map[common.Hash]*ltrInfo),
 		txPending: make(map[common.Hash]struct{}),
-		ps:        newPeerSet(),
+		ps:        ps,
+		reqDist:   reqDist,
 	}
+	ps.notify(r)
+	return r
 }
 
-func (self *LesTxRelay) addPeer(p *peer) {
+func (self *LesTxRelay) registerPeer(p *peer) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 
-	self.ps.Register(p)
 	self.peerList = self.ps.AllPeers()
 }
 
-func (self *LesTxRelay) removePeer(id string) {
+func (self *LesTxRelay) unregisterPeer(p *peer) {
 	self.lock.Lock()
 	defer self.lock.Unlock()
 
-	self.ps.Unregister(id)
 	self.peerList = self.ps.AllPeers()
 }
 
@@ -108,11 +112,27 @@ func (self *LesTxRelay) send(txs types.Transactions, count int) {
 	}
 
 	for p, list := range sendTo {
-		cost := p.GetRequestCost(SendTxMsg, len(list))
-		go func(p *peer, list types.Transactions, cost uint64) {
-			p.fcServer.SendRequest(0, cost)
-			p.SendTxs(cost, list)
-		}(p, list, cost)
+		pp := p
+		ll := list
+		enc, _ := rlp.EncodeToBytes(ll)
+
+		reqID := genReqID()
+		rq := &distReq{
+			getCost: func(dp distPeer) uint64 {
+				peer := dp.(*peer)
+				return peer.GetTxRelayCost(len(ll), len(enc))
+			},
+			canSend: func(dp distPeer) bool {
+				return !dp.(*peer).isOnlyAnnounce && dp.(*peer) == pp
+			},
+			request: func(dp distPeer) func() {
+				peer := dp.(*peer)
+				cost := peer.GetTxRelayCost(len(ll), len(enc))
+				peer.fcServer.QueuedRequest(reqID, cost)
+				return func() { peer.SendTxs(reqID, cost, enc) }
+			},
+		}
+		self.reqDist.queue(rq)
 	}
 }
 

@@ -28,17 +28,19 @@ import (
 	"testing"
 	"testing/quick"
 
+	check "gopkg.in/check.v1"
+
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/ethdb"
 )
 
 // Tests that updating a state trie does not leak any database writes prior to
 // actually committing the state.
 func TestUpdateLeaks(t *testing.T) {
 	// Create an empty state database
-	db, _ := ethdb.NewMemDatabase()
-	state, _ := New(common.Hash{}, db)
+	db := rawdb.NewMemoryDatabase()
+	state, _ := New(common.Hash{}, NewDatabase(db))
 
 	// Update it with some accounts
 	for i := byte(0); i < 255; i++ {
@@ -54,20 +56,21 @@ func TestUpdateLeaks(t *testing.T) {
 		state.IntermediateRoot(false)
 	}
 	// Ensure that no data was leaked into the database
-	for _, key := range db.Keys() {
-		value, _ := db.Get(key)
-		t.Errorf("State leaked into database: %x -> %x", key, value)
+	it := db.NewIterator()
+	for it.Next() {
+		t.Errorf("State leaked into database: %x -> %x", it.Key(), it.Value())
 	}
+	it.Release()
 }
 
 // Tests that no intermediate state of an object is stored into the database,
 // only the one right before the commit.
 func TestIntermediateLeaks(t *testing.T) {
 	// Create two state databases, one transitioning to the final state, the other final from the beginning
-	transDb, _ := ethdb.NewMemDatabase()
-	finalDb, _ := ethdb.NewMemDatabase()
-	transState, _ := New(common.Hash{}, transDb)
-	finalState, _ := New(common.Hash{}, finalDb)
+	transDb := rawdb.NewMemoryDatabase()
+	finalDb := rawdb.NewMemoryDatabase()
+	transState, _ := New(common.Hash{}, NewDatabase(transDb))
+	finalState, _ := New(common.Hash{}, NewDatabase(finalDb))
 
 	modify := func(state *StateDB, addr common.Address, i, tweak byte) {
 		state.SetBalance(addr, big.NewInt(int64(11*i)+int64(tweak)))
@@ -101,22 +104,75 @@ func TestIntermediateLeaks(t *testing.T) {
 	if _, err := finalState.Commit(false); err != nil {
 		t.Fatalf("failed to commit final state: %v", err)
 	}
-	for _, key := range finalDb.Keys() {
+	it := finalDb.NewIterator()
+	for it.Next() {
+		key := it.Key()
 		if _, err := transDb.Get(key); err != nil {
-			val, _ := finalDb.Get(key)
-			t.Errorf("entry missing from the transition database: %x -> %x", key, val)
+			t.Errorf("entry missing from the transition database: %x -> %x", key, it.Value())
 		}
 	}
-	for _, key := range transDb.Keys() {
+	it.Release()
+
+	it = transDb.NewIterator()
+	for it.Next() {
+		key := it.Key()
 		if _, err := finalDb.Get(key); err != nil {
-			val, _ := transDb.Get(key)
-			t.Errorf("extra entry in the transition database: %x -> %x", key, val)
+			t.Errorf("extra entry in the transition database: %x -> %x", key, it.Value())
+		}
+	}
+}
+
+// TestCopy tests that copying a statedb object indeed makes the original and
+// the copy independent of each other. This test is a regression test against
+// https://github.com/ethereum/go-ethereum/pull/15549.
+func TestCopy(t *testing.T) {
+	// Create a random state test to copy and modify "independently"
+	orig, _ := New(common.Hash{}, NewDatabase(rawdb.NewMemoryDatabase()))
+
+	for i := byte(0); i < 255; i++ {
+		obj := orig.GetOrNewStateObject(common.BytesToAddress([]byte{i}))
+		obj.AddBalance(big.NewInt(int64(i)))
+		orig.updateStateObject(obj)
+	}
+	orig.Finalise(false)
+
+	// Copy the state, modify both in-memory
+	copy := orig.Copy()
+
+	for i := byte(0); i < 255; i++ {
+		origObj := orig.GetOrNewStateObject(common.BytesToAddress([]byte{i}))
+		copyObj := copy.GetOrNewStateObject(common.BytesToAddress([]byte{i}))
+
+		origObj.AddBalance(big.NewInt(2 * int64(i)))
+		copyObj.AddBalance(big.NewInt(3 * int64(i)))
+
+		orig.updateStateObject(origObj)
+		copy.updateStateObject(copyObj)
+	}
+	// Finalise the changes on both concurrently
+	done := make(chan struct{})
+	go func() {
+		orig.Finalise(true)
+		close(done)
+	}()
+	copy.Finalise(true)
+	<-done
+
+	// Verify that the two states have been updated independently
+	for i := byte(0); i < 255; i++ {
+		origObj := orig.GetOrNewStateObject(common.BytesToAddress([]byte{i}))
+		copyObj := copy.GetOrNewStateObject(common.BytesToAddress([]byte{i}))
+
+		if want := big.NewInt(3 * int64(i)); origObj.Balance().Cmp(want) != 0 {
+			t.Errorf("orig obj %d: balance mismatch: have %v, want %v", i, origObj.Balance(), want)
+		}
+		if want := big.NewInt(4 * int64(i)); copyObj.Balance().Cmp(want) != 0 {
+			t.Errorf("copy obj %d: balance mismatch: have %v, want %v", i, copyObj.Balance(), want)
 		}
 	}
 }
 
 func TestSnapshotRandom(t *testing.T) {
-	t.Skip("@fjl fix me please")
 	config := &quick.Config{MaxCount: 1000}
 	err := quick.Check((*snapshotTest).run, config)
 	if cerr, ok := err.(*quick.CheckError); ok {
@@ -211,7 +267,7 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 		{
 			name: "AddRefund",
 			fn: func(a testAction, s *StateDB) {
-				s.AddRefund(big.NewInt(a.args[0]))
+				s.AddRefund(uint64(a.args[0]))
 			},
 			args:   make([]int64, 1),
 			noAddr: true,
@@ -222,6 +278,15 @@ func newTestAction(addr common.Address, r *rand.Rand) testAction {
 				data := make([]byte, 2)
 				binary.BigEndian.PutUint16(data, uint16(a.args[0]))
 				s.AddLog(&types.Log{Address: addr, Data: data})
+			},
+			args: make([]int64, 1),
+		},
+		{
+			name: "AddPreimage",
+			fn: func(a testAction, s *StateDB) {
+				preimage := []byte{1}
+				hash := common.BytesToHash(preimage)
+				s.AddPreimage(hash, preimage)
 			},
 			args: make([]int64, 1),
 		},
@@ -282,8 +347,7 @@ func (test *snapshotTest) String() string {
 func (test *snapshotTest) run() bool {
 	// Run all actions and create snapshots.
 	var (
-		db, _        = ethdb.NewMemDatabase()
-		state, _     = New(common.Hash{}, db)
+		state, _     = New(common.Hash{}, NewDatabase(rawdb.NewMemoryDatabase()))
 		snapshotRevs = make([]int, len(test.snapshots))
 		sindex       = 0
 	)
@@ -294,11 +358,10 @@ func (test *snapshotTest) run() bool {
 		}
 		action.fn(action, state)
 	}
-
 	// Revert all snapshots in reverse order. Each revert must yield a state
 	// that is equivalent to fresh state with all actions up the snapshot applied.
 	for sindex--; sindex >= 0; sindex-- {
-		checkstate, _ := New(common.Hash{}, db)
+		checkstate, _ := New(common.Hash{}, state.Database())
 		for _, action := range test.actions[:test.snapshots[sindex]] {
 			action.fn(action, checkstate)
 		}
@@ -331,13 +394,12 @@ func (test *snapshotTest) checkEqual(state, checkstate *StateDB) error {
 		checkeq("GetCodeHash", state.GetCodeHash(addr), checkstate.GetCodeHash(addr))
 		checkeq("GetCodeSize", state.GetCodeSize(addr), checkstate.GetCodeSize(addr))
 		// Check storage.
-		if obj := state.GetStateObject(addr); obj != nil {
-			obj.ForEachStorage(func(key, val common.Hash) bool {
-				return checkeq("GetState("+key.Hex()+")", val, checkstate.GetState(addr, key))
+		if obj := state.getStateObject(addr); obj != nil {
+			state.ForEachStorage(addr, func(key, value common.Hash) bool {
+				return checkeq("GetState("+key.Hex()+")", checkstate.GetState(addr, key), value)
 			})
-			checkobj := checkstate.GetStateObject(addr)
-			checkobj.ForEachStorage(func(key, checkval common.Hash) bool {
-				return checkeq("GetState("+key.Hex()+")", state.GetState(addr, key), checkval)
+			checkstate.ForEachStorage(addr, func(key, value common.Hash) bool {
+				return checkeq("GetState("+key.Hex()+")", checkstate.GetState(addr, key), value)
 			})
 		}
 		if err != nil {
@@ -345,7 +407,7 @@ func (test *snapshotTest) checkEqual(state, checkstate *StateDB) error {
 		}
 	}
 
-	if state.GetRefund().Cmp(checkstate.GetRefund()) != 0 {
+	if state.GetRefund() != checkstate.GetRefund() {
 		return fmt.Errorf("got GetRefund() == %d, want GetRefund() == %d",
 			state.GetRefund(), checkstate.GetRefund())
 	}
@@ -356,21 +418,34 @@ func (test *snapshotTest) checkEqual(state, checkstate *StateDB) error {
 	return nil
 }
 
-func TestTouchDelete(t *testing.T) {
-	db, _ := ethdb.NewMemDatabase()
-	state, _ := New(common.Hash{}, db)
-	state.GetOrNewStateObject(common.Address{})
-	root, _ := state.Commit(false)
-	state.Reset(root)
+func (s *StateSuite) TestTouchDelete(c *check.C) {
+	s.state.GetOrNewStateObject(common.Address{})
+	root, _ := s.state.Commit(false)
+	s.state.Reset(root)
 
-	snapshot := state.Snapshot()
-	state.AddBalance(common.Address{}, new(big.Int))
-	if len(state.stateObjectsDirty) != 1 {
-		t.Fatal("expected one dirty state object")
+	snapshot := s.state.Snapshot()
+	s.state.AddBalance(common.Address{}, new(big.Int))
+
+	if len(s.state.journal.dirties) != 1 {
+		c.Fatal("expected one dirty state object")
 	}
+	s.state.RevertToSnapshot(snapshot)
+	if len(s.state.journal.dirties) != 0 {
+		c.Fatal("expected no dirty state object")
+	}
+}
 
-	state.RevertToSnapshot(snapshot)
-	if len(state.stateObjectsDirty) != 0 {
-		t.Fatal("expected no dirty state object")
+// TestCopyOfCopy tests that modified objects are carried over to the copy, and the copy of the copy.
+// See https://github.com/ethereum/go-ethereum/pull/15225#issuecomment-380191512
+func TestCopyOfCopy(t *testing.T) {
+	sdb, _ := New(common.Hash{}, NewDatabase(rawdb.NewMemoryDatabase()))
+	addr := common.HexToAddress("aaaa")
+	sdb.SetBalance(addr, big.NewInt(42))
+
+	if got := sdb.Copy().GetBalance(addr).Uint64(); got != 42 {
+		t.Fatalf("1st copy fail, expected 42, got %v", got)
+	}
+	if got := sdb.Copy().Copy().GetBalance(addr).Uint64(); got != 42 {
+		t.Fatalf("2nd copy fail, expected 42, got %v", got)
 	}
 }

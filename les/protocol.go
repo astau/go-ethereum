@@ -14,29 +14,38 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-// Package les implements the Light Ethereum Subprotocol.
 package les
 
 import (
+	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // Constants to match up protocol versions and messages
 const (
 	lpv1 = 1
+	lpv2 = 2
 )
 
-// Supported versions of the les protocol (first is primary).
-var ProtocolVersions = []uint{lpv1}
+// Supported versions of the les protocol (first is primary)
+var (
+	ClientProtocolVersions    = []uint{lpv2, lpv1}
+	ServerProtocolVersions    = []uint{lpv2, lpv1}
+	AdvertiseProtocolVersions = []uint{lpv2} // clients are searching for the first advertised protocol in the list
+)
 
 // Number of implemented message corresponding to different protocol versions.
-var ProtocolLengths = []uint64{15}
+var ProtocolLengths = map[uint]uint64{lpv1: 15, lpv2: 22}
 
 const (
 	NetworkId          = 1
@@ -54,14 +63,41 @@ const (
 	BlockBodiesMsg     = 0x05
 	GetReceiptsMsg     = 0x06
 	ReceiptsMsg        = 0x07
-	GetProofsMsg       = 0x08
-	ProofsMsg          = 0x09
+	GetProofsV1Msg     = 0x08
+	ProofsV1Msg        = 0x09
 	GetCodeMsg         = 0x0a
 	CodeMsg            = 0x0b
 	SendTxMsg          = 0x0c
 	GetHeaderProofsMsg = 0x0d
 	HeaderProofsMsg    = 0x0e
+	// Protocol messages belonging to LPV2
+	GetProofsV2Msg         = 0x0f
+	ProofsV2Msg            = 0x10
+	GetHelperTrieProofsMsg = 0x11
+	HelperTrieProofsMsg    = 0x12
+	SendTxV2Msg            = 0x13
+	GetTxStatusMsg         = 0x14
+	TxStatusMsg            = 0x15
 )
+
+type requestInfo struct {
+	name     string
+	maxCount uint64
+}
+
+var requests = map[uint64]requestInfo{
+	GetBlockHeadersMsg:     {"GetBlockHeaders", MaxHeaderFetch},
+	GetBlockBodiesMsg:      {"GetBlockBodies", MaxBodyFetch},
+	GetReceiptsMsg:         {"GetReceipts", MaxReceiptFetch},
+	GetProofsV1Msg:         {"GetProofsV1", MaxProofsFetch},
+	GetCodeMsg:             {"GetCode", MaxCodeFetch},
+	SendTxMsg:              {"SendTx", MaxTxSend},
+	GetHeaderProofsMsg:     {"GetHeaderProofs", MaxHelperTrieProofsFetch},
+	GetProofsV2Msg:         {"GetProofsV2", MaxProofsFetch},
+	GetHelperTrieProofsMsg: {"GetHelperTrieProofs", MaxHelperTrieProofsFetch},
+	SendTxV2Msg:            {"SendTxV2", MaxTxSend},
+	GetTxStatusMsg:         {"GetTxStatus", MaxTxStatus},
+}
 
 type errCode int
 
@@ -80,7 +116,7 @@ const (
 	ErrUnexpectedResponse
 	ErrInvalidResponse
 	ErrTooManyTimeouts
-	ErrHandshakeMissingKey
+	ErrMissingKey
 )
 
 func (e errCode) String() string {
@@ -102,13 +138,13 @@ var errorToString = map[int]string{
 	ErrUnexpectedResponse:      "Unexpected response",
 	ErrInvalidResponse:         "Invalid response",
 	ErrTooManyTimeouts:         "Too many request timeouts",
-	ErrHandshakeMissingKey:     "Key missing from handshake message",
+	ErrMissingKey:              "Key missing from list",
 }
 
-type chainManager interface {
-	GetBlockHashesFromHash(hash common.Hash, amount uint64) (hashes []common.Hash)
-	GetBlock(hash common.Hash) (block *types.Block)
-	Status() (td *big.Int, currentBlock common.Hash, genesisBlock common.Hash)
+type announceBlock struct {
+	Hash   common.Hash // Hash of one particular block being announced
+	Number uint64      // Number of one particular block being announced
+	Td     *big.Int    // Total difficulty of one particular block being announced
 }
 
 // announceData is the network packet for the block announcements.
@@ -118,23 +154,36 @@ type announceData struct {
 	Td         *big.Int    // Total difficulty of one particular block being announced
 	ReorgDepth uint64
 	Update     keyValueList
+}
 
-	haveHeaders uint64 // we have the headers of the remote peer's chain up to this number
-	headKnown   bool
-	requested   bool
-	next        *announceData
+// sign adds a signature to the block announcement by the given privKey
+func (a *announceData) sign(privKey *ecdsa.PrivateKey) {
+	rlp, _ := rlp.EncodeToBytes(announceBlock{a.Hash, a.Number, a.Td})
+	sig, _ := crypto.Sign(crypto.Keccak256(rlp), privKey)
+	a.Update = a.Update.add("sign", sig)
+}
+
+// checkSignature verifies if the block announcement has a valid signature by the given pubKey
+func (a *announceData) checkSignature(id enode.ID, update keyValueMap) error {
+	var sig []byte
+	if err := update.get("sign", &sig); err != nil {
+		return err
+	}
+	rlp, _ := rlp.EncodeToBytes(announceBlock{a.Hash, a.Number, a.Td})
+	recPubkey, err := crypto.SigToPub(crypto.Keccak256(rlp), sig)
+	if err != nil {
+		return err
+	}
+	if id == enode.PubkeyToIDV4(recPubkey) {
+		return nil
+	}
+	return errors.New("wrong signature")
 }
 
 type blockInfo struct {
 	Hash   common.Hash // Hash of one particular block being announced
 	Number uint64      // Number of one particular block being announced
 	Td     *big.Int    // Total difficulty of one particular block being announced
-}
-
-// getBlockHashesData is the network packet for the hash based hash retrieval.
-type getBlockHashesData struct {
-	Hash   common.Hash
-	Amount uint64
 }
 
 // getBlockHeadersData represents a block header query.
@@ -181,18 +230,15 @@ func (hn *hashOrNumber) DecodeRLP(s *rlp.Stream) error {
 	return err
 }
 
-// newBlockData is the network packet for the block propagation message.
-type newBlockData struct {
-	Block *types.Block
-	TD    *big.Int
-}
-
-// blockBodiesData is the network packet for block content distribution.
-type blockBodiesData []*types.Body
-
 // CodeData is the network response packet for a node data retrieval.
 type CodeData []struct {
 	Value []byte
 }
 
 type proofsData [][]rlp.RawValue
+
+type txStatus struct {
+	Status core.TxStatus
+	Lookup *rawdb.LegacyTxLookupEntry `rlp:"nil"`
+	Error  string
+}

@@ -18,148 +18,189 @@ package rpc
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
-	"sync"
+	"strings"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
-type NotificationTestService struct {
-	mu           sync.Mutex
-	unsubscribed bool
+func TestNewID(t *testing.T) {
+	hexchars := "0123456789ABCDEFabcdef"
+	for i := 0; i < 100; i++ {
+		id := string(NewID())
+		if !strings.HasPrefix(id, "0x") {
+			t.Fatalf("invalid ID prefix, want '0x...', got %s", id)
+		}
 
-	gotHangSubscriptionReq  chan struct{}
-	unblockHangSubscription chan struct{}
-}
+		id = id[2:]
+		if len(id) == 0 || len(id) > 32 {
+			t.Fatalf("invalid ID length, want len(id) > 0 && len(id) <= 32), got %d", len(id))
+		}
 
-func (s *NotificationTestService) Echo(i int) int {
-	return i
-}
-
-func (s *NotificationTestService) wasUnsubCallbackCalled() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.unsubscribed
-}
-
-func (s *NotificationTestService) Unsubscribe(subid string) {
-	s.mu.Lock()
-	s.unsubscribed = true
-	s.mu.Unlock()
-}
-
-func (s *NotificationTestService) SomeSubscription(ctx context.Context, n, val int) (*Subscription, error) {
-	notifier, supported := NotifierFromContext(ctx)
-	if !supported {
-		return nil, ErrNotificationsUnsupported
-	}
-
-	// by explicitly creating an subscription we make sure that the subscription id is send back to the client
-	// before the first subscription.Notify is called. Otherwise the events might be send before the response
-	// for the eth_subscribe method.
-	subscription := notifier.CreateSubscription()
-
-	go func() {
-		// test expects n events, if we begin sending event immediately some events
-		// will probably be dropped since the subscription ID might not be send to
-		// the client.
-		time.Sleep(5 * time.Second)
-		for i := 0; i < n; i++ {
-			if err := notifier.Notify(subscription.ID, val+i); err != nil {
-				return
+		for i := 0; i < len(id); i++ {
+			if strings.IndexByte(hexchars, id[i]) == -1 {
+				t.Fatalf("unexpected byte, want any valid hex char, got %c", id[i])
 			}
 		}
+	}
+}
 
-		select {
-		case <-notifier.Closed():
-			s.mu.Lock()
-			s.unsubscribed = true
-			s.mu.Unlock()
-		case <-subscription.Err():
-			s.mu.Lock()
-			s.unsubscribed = true
-			s.mu.Unlock()
+func TestSubscriptions(t *testing.T) {
+	var (
+		namespaces        = []string{"eth", "shh", "bzz"}
+		service           = &notificationTestService{}
+		subCount          = len(namespaces)
+		notificationCount = 3
+
+		server                 = NewServer()
+		clientConn, serverConn = net.Pipe()
+		out                    = json.NewEncoder(clientConn)
+		in                     = json.NewDecoder(clientConn)
+		successes              = make(chan subConfirmation)
+		notifications          = make(chan subscriptionResult)
+		errors                 = make(chan error, subCount*notificationCount+1)
+	)
+
+	// setup and start server
+	for _, namespace := range namespaces {
+		if err := server.RegisterName(namespace, service); err != nil {
+			t.Fatalf("unable to register test service %v", err)
 		}
-	}()
-
-	return subscription, nil
-}
-
-// HangSubscription blocks on s.unblockHangSubscription before
-// sending anything.
-func (s *NotificationTestService) HangSubscription(ctx context.Context, val int) (*Subscription, error) {
-	notifier, supported := NotifierFromContext(ctx)
-	if !supported {
-		return nil, ErrNotificationsUnsupported
 	}
-
-	s.gotHangSubscriptionReq <- struct{}{}
-	<-s.unblockHangSubscription
-	subscription := notifier.CreateSubscription()
-
-	go func() {
-		notifier.Notify(subscription.ID, val)
-	}()
-	return subscription, nil
-}
-
-func TestNotifications(t *testing.T) {
-	server := NewServer()
-	service := &NotificationTestService{}
-
-	if err := server.RegisterName("eth", service); err != nil {
-		t.Fatalf("unable to register test service %v", err)
-	}
-
-	clientConn, serverConn := net.Pipe()
-
 	go server.ServeCodec(NewJSONCodec(serverConn), OptionMethodInvocation|OptionSubscriptions)
+	defer server.Stop()
 
-	out := json.NewEncoder(clientConn)
-	in := json.NewDecoder(clientConn)
+	// wait for message and write them to the given channels
+	go waitForMessages(in, successes, notifications, errors)
 
-	n := 5
-	val := 12345
-	request := map[string]interface{}{
-		"id":      1,
-		"method":  "eth_subscribe",
-		"version": "2.0",
-		"params":  []interface{}{"someSubscription", n, val},
-	}
-
-	// create subscription
-	if err := out.Encode(request); err != nil {
-		t.Fatal(err)
-	}
-
-	var subid string
-	response := jsonSuccessResponse{Result: subid}
-	if err := in.Decode(&response); err != nil {
-		t.Fatal(err)
-	}
-
-	var ok bool
-	if _, ok = response.Result.(string); !ok {
-		t.Fatalf("expected subscription id, got %T", response.Result)
-	}
-
-	for i := 0; i < n; i++ {
-		var notification jsonNotification
-		if err := in.Decode(&notification); err != nil {
-			t.Fatalf("%v", err)
+	// create subscriptions one by one
+	for i, namespace := range namespaces {
+		request := map[string]interface{}{
+			"id":      i,
+			"method":  fmt.Sprintf("%s_subscribe", namespace),
+			"version": "2.0",
+			"params":  []interface{}{"someSubscription", notificationCount, i},
 		}
-
-		if int(notification.Params.Result.(float64)) != val+i {
-			t.Fatalf("expected %d, got %d", val+i, notification.Params.Result)
+		if err := out.Encode(&request); err != nil {
+			t.Fatalf("Could not create subscription: %v", err)
 		}
 	}
 
-	clientConn.Close() // causes notification unsubscribe callback to be called
-	time.Sleep(1 * time.Second)
+	timeout := time.After(30 * time.Second)
+	subids := make(map[string]string, subCount)
+	count := make(map[string]int, subCount)
+	allReceived := func() bool {
+		done := len(count) == subCount
+		for _, c := range count {
+			if c < notificationCount {
+				done = false
+			}
+		}
+		return done
+	}
+	for !allReceived() {
+		select {
+		case confirmation := <-successes: // subscription created
+			subids[namespaces[confirmation.reqid]] = string(confirmation.subid)
+		case notification := <-notifications:
+			count[notification.ID]++
+		case err := <-errors:
+			t.Fatal(err)
+		case <-timeout:
+			for _, namespace := range namespaces {
+				subid, found := subids[namespace]
+				if !found {
+					t.Errorf("subscription for %q not created", namespace)
+					continue
+				}
+				if count, found := count[subid]; !found || count < notificationCount {
+					t.Errorf("didn't receive all notifications (%d<%d) in time for namespace %q", count, notificationCount, namespace)
+				}
+			}
+			t.Fatal("timed out")
+		}
+	}
+}
 
-	if !service.wasUnsubCallbackCalled() {
-		t.Error("unsubscribe callback not called after closing connection")
+// This test checks that unsubscribing works.
+func TestServerUnsubscribe(t *testing.T) {
+	// Start the server.
+	server := newTestServer()
+	service := &notificationTestService{unsubscribed: make(chan string)}
+	server.RegisterName("nftest2", service)
+	p1, p2 := net.Pipe()
+	go server.ServeCodec(NewJSONCodec(p1), OptionMethodInvocation|OptionSubscriptions)
+
+	p2.SetDeadline(time.Now().Add(10 * time.Second))
+
+	// Subscribe.
+	p2.Write([]byte(`{"jsonrpc":"2.0","id":1,"method":"nftest2_subscribe","params":["someSubscription",0,10]}`))
+
+	// Handle received messages.
+	resps := make(chan subConfirmation)
+	notifications := make(chan subscriptionResult)
+	errors := make(chan error)
+	go waitForMessages(json.NewDecoder(p2), resps, notifications, errors)
+
+	// Receive the subscription ID.
+	var sub subConfirmation
+	select {
+	case sub = <-resps:
+	case err := <-errors:
+		t.Fatal(err)
+	}
+
+	// Unsubscribe and check that it is handled on the server side.
+	p2.Write([]byte(`{"jsonrpc":"2.0","method":"nftest2_unsubscribe","params":["` + sub.subid + `"]}`))
+	for {
+		select {
+		case id := <-service.unsubscribed:
+			if id != string(sub.subid) {
+				t.Errorf("wrong subscription ID unsubscribed")
+			}
+			return
+		case err := <-errors:
+			t.Fatal(err)
+		case <-notifications:
+			// drop notifications
+		}
+	}
+}
+
+type subConfirmation struct {
+	reqid int
+	subid ID
+}
+
+func waitForMessages(in *json.Decoder, successes chan subConfirmation, notifications chan subscriptionResult, errors chan error) {
+	for {
+		var msg jsonrpcMessage
+		if err := in.Decode(&msg); err != nil {
+			errors <- fmt.Errorf("decode error: %v", err)
+			return
+		}
+		switch {
+		case msg.isNotification():
+			var res subscriptionResult
+			if err := json.Unmarshal(msg.Params, &res); err != nil {
+				errors <- fmt.Errorf("invalid subscription result: %v", err)
+			} else {
+				notifications <- res
+			}
+		case msg.isResponse():
+			var c subConfirmation
+			if msg.Error != nil {
+				errors <- msg.Error
+			} else if err := json.Unmarshal(msg.Result, &c.subid); err != nil {
+				errors <- fmt.Errorf("invalid response: %v", err)
+			} else {
+				json.Unmarshal(msg.ID, &c.reqid)
+				successes <- c
+			}
+		default:
+			errors <- fmt.Errorf("unrecognized message: %v", msg)
+			return
+		}
 	}
 }
